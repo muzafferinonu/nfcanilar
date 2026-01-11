@@ -1,459 +1,171 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { supabase } from "../../lib/supabaseClient";
-import { deriveKeyFromNFC, encryptPayload, decryptPayload } from "../../lib/crypto";
 
-type Step = "NEED_2_NFC" | "CAMERA" | "PREVIEW_FORM" | "SAVED";
-
-type PairRow = {
-  id: string;
-  token_a: string | null;
-  token_b: string | null;
-  is_complete: boolean | null;
+type ScanState = {
+  pairId?: string;
+  a: boolean;
+  b: boolean;
+  complete: boolean;
+  error?: string;
 };
-
-type MemoryRow = {
-  id: string;
-  pair_id: string;
-  encrypted_payload: string | null;
-  photo_url: string | null;
-  quote: string | null;
-};
-
-function nowISO() {
-  return new Date().toISOString();
-}
 
 export default function MPage() {
   const sp = useSearchParams();
-  const token = (sp.get("k") || "").trim(); // artık gerçek token gelecek
+  const token = useMemo(() => sp.get("t") || "", [sp]);
 
-  const [step, setStep] = useState<Step>("NEED_2_NFC");
-  const [error, setError] = useState<string>("");
+  const [state, setState] = useState<ScanState>({
+    a: false,
+    b: false,
+    complete: false,
+  });
 
-  const [pairId, setPairId] = useState<string>("");
-  const [tokenA, setTokenA] = useState<string>("");
-  const [tokenB, setTokenB] = useState<string>("");
-  const [progress, setProgress] = useState<"0/2" | "1/2" | "2/2">("0/2");
+  const [loading, setLoading] = useState(false);
 
-  // Kamera
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const [photoDataUrl, setPhotoDataUrl] = useState<string>("");
-
-  // Söz
-  const [quote, setQuote] = useState<string>("");
-
-  // Kayıt sonucu
-  const [savedId, setSavedId] = useState<string>("");
-
-  // -----------------------------
-  // Helpers: Pair bul/oluştur/tamamla
-  // -----------------------------
-
-  async function findPairByToken(t: string): Promise<PairRow | null> {
-    // token_a = t
-    const a = await supabase
-      .from("pairs")
-      .select("id, token_a, token_b, is_complete")
-      .eq("token_a", t)
-      .maybeSingle();
-
-    if (a.data) return a.data as PairRow;
-
-    // token_b = t
-    const b = await supabase
-      .from("pairs")
-      .select("id, token_a, token_b, is_complete")
-      .eq("token_b", t)
-      .maybeSingle();
-
-    if (b.data) return b.data as PairRow;
-
-    return null;
-  }
-
-  async function findOpenPairToComplete(excludeToken: string): Promise<PairRow | null> {
-    // token_b boş olan (henüz tamamlanmamış) bir pair bulalım
-    // en yenisini almak için created_at yoksa id ile zor, ama şimdilik "limit 1" yeter
-    const { data, error } = await supabase
-      .from("pairs")
-      .select("id, token_a, token_b, is_complete")
-      .is("token_b", null)
-      .neq("token_a", excludeToken)
-      .limit(1);
-
-    if (error) return null;
-    if (!data || data.length === 0) return null;
-    return data[0] as PairRow;
-  }
-
-  async function createPair(t: string): Promise<PairRow> {
-    const { data, error } = await supabase
-      .from("pairs")
-      .insert({
-        token_a: t,
-        token_b: null,
-        is_complete: false,
-      })
-      .select("id, token_a, token_b, is_complete")
-      .single();
-
-    if (error) throw error;
-    return data as PairRow;
-  }
-
-  async function completePair(pair: PairRow, secondToken: string): Promise<PairRow> {
-    const { data, error } = await supabase
-      .from("pairs")
-      .update({
-        token_b: secondToken,
-        is_complete: true,
-      })
-      .eq("id", pair.id)
-      .select("id, token_a, token_b, is_complete")
-      .single();
-
-    if (error) throw error;
-    return data as PairRow;
-  }
-
-  // -----------------------------
-  // 1) Token geldiğinde pair akışını çalıştır
-  // -----------------------------
   useEffect(() => {
-    setError("");
-    setSavedId("");
-    setPhotoDataUrl("");
-    setQuote("");
-
-    if (!token) {
-      setProgress("0/2");
-      setStep("NEED_2_NFC");
-      return;
-    }
+    if (!token) return;
 
     (async () => {
+      setLoading(true);
+      setState((s) => ({ ...s, error: undefined }));
+
       try {
-        // 1) Bu token zaten bir pair içinde mi?
-        let pair = await findPairByToken(token);
+        const res = await fetch("/api/scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
 
-        if (!pair) {
-          // 2) Değilse: tamamlanmayı bekleyen açık pair var mı?
-          const open = await findOpenPairToComplete(token);
+        const data = await res.json();
 
-          if (open && open.token_a) {
-            // Bu token ikinci NFC olarak geldi, open pair'i tamamla
-            pair = await completePair(open, token);
-          } else {
-            // 3) Hiç open yoksa yeni pair başlat (ilk NFC)
-            pair = await createPair(token);
-          }
+        if (!res.ok) {
+          setState({
+            a: false,
+            b: false,
+            complete: false,
+            error: data?.error || "Hata oluştu",
+          });
+          return;
         }
 
-        setPairId(pair.id);
-        setTokenA(pair.token_a || "");
-        setTokenB(pair.token_b || "");
+        setState({
+          pairId: data.pairId,
+          a: !!data.a,
+          b: !!data.b,
+          complete: !!data.complete,
+        });
 
-        if (pair.token_a && pair.token_b) {
-          setProgress("2/2");
-          setStep("CAMERA");
-        } else {
-          setProgress("1/2");
-          setStep("NEED_2_NFC");
-        }
+        // Kilit açıldıysa istersen otomatik anılara gönder:
+        // if (data.complete) {
+        //   window.location.href = `/anilar?pair=${data.pairId}`;
+        // }
       } catch (e: any) {
-        setError("Pair işlemi hata: " + (e?.message || "Bilinmiyor"));
-        setProgress("0/2");
-        setStep("NEED_2_NFC");
+        setState({
+          a: false,
+          b: false,
+          complete: false,
+          error: e?.message || "Bilinmeyen hata",
+        });
+      } finally {
+        setLoading(false);
       }
     })();
   }, [token]);
 
-  // -----------------------------
-  // 2) 2/2 olunca: mevcut memory var mı çek + decrypt et
-  // -----------------------------
-  useEffect(() => {
-    if (progress !== "2/2") return;
-    if (!pairId) return;
-
-    (async () => {
-      try {
-        const { data, error } = await supabase
-          .from("memories")
-          .select("id, pair_id, encrypted_payload, photo_url, quote")
-          .eq("pair_id", pairId)
-          .order("created_at", { ascending: false })
-          .limit(1);
-
-        if (error) return;
-        if (!data || data.length === 0) return;
-
-        const row = data[0] as MemoryRow;
-
-        // Öncelik: encrypted_payload varsa onu çöz
-        if (row.encrypted_payload && tokenA && tokenB) {
-          const key = await deriveKeyFromNFC(tokenA, tokenB);
-          const payload = await decryptPayload(key, row.encrypted_payload);
-
-          setPhotoDataUrl(payload.photoDataUrl || "");
-          setQuote(payload.quote || "");
-        } else {
-          // şifre yoksa düz alanlardan göster
-          setPhotoDataUrl(row.photo_url || "");
-          setQuote(row.quote || "");
-        }
-
-        setSavedId(row.id);
-        setStep("PREVIEW_FORM");
-
-        // Kamera açıksa kapat
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((t) => t.stop());
-          streamRef.current = null;
-        }
-      } catch {
-        // sessiz geç
-      }
-    })();
-  }, [progress, pairId, tokenA, tokenB]);
-
-  // -----------------------------
-  // 3) Kamera başlat
-  // -----------------------------
-  useEffect(() => {
-    if (step !== "CAMERA") return;
-    if (progress !== "2/2") return;
-
-    (async () => {
-      try {
-        setError("");
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
-          audio: false,
-        });
-
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
-        }
-      } catch (e: any) {
-        setError("Kamera açılamadı: " + (e?.message || "Bilinmiyor"));
-      }
-    })();
-
-    return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-      }
-    };
-  }, [step, progress]);
-
-  const canCapture = useMemo(() => step === "CAMERA" && progress === "2/2", [step, progress]);
-
-  function capturePhoto() {
-    setError("");
-    const video = videoRef.current;
-    if (!video) return;
-
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth || 1280;
-    canvas.height = video.videoHeight || 720;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
-
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-
-    setPhotoDataUrl(dataUrl);
-    setStep("PREVIEW_FORM");
-  }
-
-  function resetUIOnly() {
-    // DB'yi silmiyoruz; sadece ekranda sıfırlarız
-    setPhotoDataUrl("");
-    setQuote("");
-    setSavedId("");
-    if (progress === "2/2") setStep("CAMERA");
-    else setStep("NEED_2_NFC");
-    setError("");
-  }
-
-  // -----------------------------
-  // 4) Kaydet: pair_id ile memories’e yaz
-  // -----------------------------
-  async function save() {
-    try {
-      setError("");
-
-      if (progress !== "2/2" || !pairId || !tokenA || !tokenB) {
-        setError("2 NFC tamamlanmadan kaydedilemez.");
-        return;
-      }
-      if (!photoDataUrl) {
-        setError("Önce foto çek.");
-        return;
-      }
-      if (!quote.trim()) {
-        setError("Söz boş olamaz.");
-        return;
-      }
-
-      const payload = {
-        v: "v1",
-        quote: quote.trim(),
-        createdAt: nowISO(),
-        photoDataUrl,
-      };
-
-      const key = await deriveKeyFromNFC(tokenA, tokenB);
-      const encrypted = await encryptPayload(key, payload);
-
-      const { data, error } = await supabase
-        .from("memories")
-        .insert({
-          pair_id: pairId,
-          encrypted_payload: encrypted,
-          payload_version: "v1",
-          is_locked: false,
-          is_test: false,
-          // photo_url / quote düz de basmak istersen:
-          photo_url: null,
-          quote: null,
-        })
-        .select("id")
-        .single();
-
-      if (error) throw error;
-
-      setSavedId(data.id);
-      setStep("SAVED");
-    } catch (e: any) {
-      setError("Kaydedilemedi: " + (e?.message || "Bilinmiyor"));
-    }
-  }
-
   return (
-    <main style={{ padding: 18, maxWidth: 680, margin: "0 auto", fontFamily: "system-ui, Arial" }}>
-      <h1 style={{ fontSize: 28, marginBottom: 8 }}>/m — NFC Anı</h1>
+    <div style={{ padding: 24, fontFamily: "system-ui" }}>
+      <h1 style={{ fontSize: 40, margin: 0 }}>📷 Anılar Sayfası</h1>
+      <p style={{ opacity: 0.8, marginTop: 10 }}>
+        Bu sayfa NFC ile açılmak için hazır. İki NFC okutulduğunda anılar açılacak.
+      </p>
 
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12 }}>
-        <div>
-          <b>İlerleme:</b> {progress}
-        </div>
-        <button onClick={resetUIOnly} style={{ marginLeft: "auto" }}>
-          Ekranı Sıfırla
-        </button>
-      </div>
+      <hr style={{ margin: "16px 0", opacity: 0.2 }} />
 
-      <div style={{ opacity: 0.85, marginBottom: 12 }}>
-        <div>
-          <b>Token:</b> <code>{token || "(yok)"}</code>
-        </div>
-        <div>
-          <b>pair_id:</b> <code>{pairId || "(yok)"}</code>
-        </div>
-      </div>
-
-      {error && (
-        <div style={{ background: "#2a0000", color: "#ffd0d0", padding: 10, borderRadius: 8, marginBottom: 12 }}>
-          {error}
+      {!token && (
+        <div
+          style={{
+            marginTop: 16,
+            padding: 14,
+            border: "1px solid #333",
+            borderRadius: 14,
+          }}
+        >
+          <b>Token yok.</b>
+          <div style={{ marginTop: 8, opacity: 0.85 }}>
+            URL şu formatta olmalı: <code>/m?t=TOKEN</code>
+          </div>
         </div>
       )}
 
-      {step === "NEED_2_NFC" && (
-        <div style={{ background: "#111", padding: 14, borderRadius: 10 }}>
-          <p style={{ marginTop: 0 }}>2 NFC birlikte okutulmadan hiçbir şey açılmaz.</p>
-          <p style={{ marginBottom: 0 }}>
-            Şu an <b>1/2</b> isen, ikinci etiketi okutunca otomatik tamamlanır.
-          </p>
-        </div>
-      )}
-
-      {step === "CAMERA" && (
-        <div style={{ background: "#111", padding: 14, borderRadius: 10 }}>
-          <p style={{ marginTop: 0 }}>
-            ✅ 2/2 oldu. Şimdi <b>kamera</b> açık.
-          </p>
-
-          <video ref={videoRef} playsInline muted style={{ width: "100%", borderRadius: 10, background: "#000" }} />
-
-          <button
-            onClick={capturePhoto}
-            disabled={!canCapture}
-            style={{ marginTop: 12, width: "100%", padding: 12, fontSize: 16 }}
-          >
-            Foto Çek
-          </button>
-        </div>
-      )}
-
-      {step === "PREVIEW_FORM" && (
-        <div style={{ background: "#111", padding: 14, borderRadius: 10 }}>
-          <p style={{ marginTop: 0 }}>
-            Foto hazır. Şimdi sözünü yaz ve <b>Kaydet</b>.
-          </p>
-
-          {photoDataUrl ? (
-            <img src={photoDataUrl} alt="Foto" style={{ width: "100%", borderRadius: 10, marginBottom: 12 }} />
-          ) : (
-            <div style={{ opacity: 0.85, marginBottom: 12 }}>Foto yok.</div>
+      {token && (
+        <div style={{ marginTop: 8 }}>
+          {loading && (
+            <div style={{ marginTop: 10, opacity: 0.85 }}>Kontrol ediliyor...</div>
           )}
 
-          <label style={{ display: "block", marginBottom: 6 }}>Özel söz</label>
-          <textarea
-            value={quote}
-            onChange={(e) => setQuote(e.target.value)}
-            rows={4}
-            placeholder="Buraya özel söz..."
-            style={{ width: "100%", padding: 10, borderRadius: 8 }}
-          />
+          {state.error ? (
+            <div
+              style={{
+                marginTop: 16,
+                padding: 14,
+                border: "1px solid #a00",
+                borderRadius: 14,
+              }}
+            >
+              ❌ {state.error}
+            </div>
+          ) : (
+            <>
+              <div style={{ marginTop: 14, fontSize: 18, lineHeight: 1.9 }}>
+                <div>
+                  1. NFC:{" "}
+                  <b>{state.a ? "✅ OKUNDU (1/2)" : "⬜ Bekleniyor (0/2)"}</b>
+                </div>
+                <div>
+                  2. NFC: <b>{state.b ? "✅ OKUNDU (2/2)" : "⬜ Bekleniyor"}</b>
+                </div>
+              </div>
 
-          <div style={{ marginTop: 10, opacity: 0.85 }}>
-            <b>Tarih/Saat:</b> {new Date().toLocaleString()}
-          </div>
+              <div
+                style={{
+                  marginTop: 16,
+                  padding: 16,
+                  border: "1px solid #333",
+                  borderRadius: 16,
+                }}
+              >
+                {state.complete ? (
+                  <>
+                    <div style={{ fontSize: 20 }}>
+                      🎉 <b>Kilit Açıldı</b>
+                    </div>
+                    <div style={{ marginTop: 6, opacity: 0.85 }}>
+                      Buraya anıları (foto/video/metin) koyacağız.
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 20 }}>
+                      🔒 <b>Kilitli</b>
+                    </div>
+                    <div style={{ marginTop: 6, opacity: 0.85 }}>
+                      İkinci NFC de okutulunca açılacak.
+                    </div>
+                  </>
+                )}
+              </div>
 
-          <button onClick={save} style={{ marginTop: 12, width: "100%", padding: 12, fontSize: 16 }}>
-            Kaydet
-          </button>
-
-          <button
-            onClick={() => {
-              setPhotoDataUrl("");
-              setStep("CAMERA");
-            }}
-            style={{ marginTop: 10, width: "100%", padding: 10 }}
-          >
-            Yeniden Çek
-          </button>
+              {/* İstersen debug amaçlı pairId göster */}
+              {state.pairId && (
+                <div style={{ marginTop: 10, opacity: 0.6, fontSize: 12 }}>
+                  pairId: <code>{state.pairId}</code>
+                </div>
+              )}
+            </>
+          )}
         </div>
       )}
-
-      {step === "SAVED" && (
-        <div style={{ background: "#0b1b0b", padding: 14, borderRadius: 10 }}>
-          <h2 style={{ marginTop: 0 }}>✅ Kayıt alındı</h2>
-          <p style={{ marginBottom: 6 }}>Supabase kaydı (id):</p>
-          <code style={{ display: "block", padding: 10, background: "#061006", borderRadius: 8 }}>{savedId}</code>
-
-          <p style={{ opacity: 0.85 }}>
-            Aynı iki NFC tekrar okutulunca (tokenA+tokenB tamamlanınca) bu pair’ın kaydı çekilip gösterilir.
-          </p>
-
-          <button onClick={resetUIOnly} style={{ marginTop: 10, width: "100%", padding: 12 }}>
-            Devam
-          </button>
-        </div>
-      )}
-    </main>
+    </div>
   );
 }
